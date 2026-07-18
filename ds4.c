@@ -19142,6 +19142,10 @@ static bool metal_graph_eval_mtp_draft_from_hc(
          * input assembly -> MTP block output -> output head -> logits. */
         fprintf(stderr, "ds4: mtp-dump ---- draft pos=%u token=%d ----\n", pos, token);
         mtp_debug_dump_tensor_stats("prev_hc(in)", prev_hc, hc_dim);
+        mtp_debug_dump_tensor_stats("mtp_embed", g->mtp_embed, DS4_N_EMBD);
+        mtp_debug_dump_tensor_stats("mtp_enorm", g->mtp_enorm, DS4_N_EMBD);
+        mtp_debug_dump_tensor_stats("mtp_eproj", g->mtp_eproj, DS4_N_EMBD);
+        mtp_debug_dump_tensor_stats("mtp_hnorm_hc", g->mtp_hnorm_hc, hc_dim);
         mtp_debug_dump_tensor_stats("mtp_eproj_hc", g->mtp_eproj_hc, hc_dim);
         mtp_debug_dump_tensor_stats("mtp_hproj_hc", g->mtp_hproj_hc, hc_dim);
         mtp_debug_dump_tensor_stats("mtp_input_hc", g->mtp_input_hc, hc_dim);
