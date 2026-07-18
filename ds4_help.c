@@ -176,6 +176,11 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
         }
+        if (tool == DS4_HELP_SERVER) {
+            opt(fp, c, "--force-nothink", "Disable thinking for every request regardless of client params (alias: --thinking off).");
+            opt(fp, c, "--thinking off|on|pin-off", "Pin thinking mode for all requests. off/pin-off force it off; on keeps client control. Default: on.");
+            opt(fp, c, "--force-temp F", "Pin the effective sampling temperature for every request, overriding client params and thinking. Use with --force-nothink --force-temp 0 to keep MTP speculation enabled for all clients.");
+        }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {

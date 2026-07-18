@@ -507,6 +507,11 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 
 typedef struct server server;
 
+/* Operator sampling pins. Defined after `struct server` is complete; declared
+ * here because request parsers run while `server` is still an opaque type. */
+static bool server_force_nothink(const server *s);
+static bool server_force_temp(const server *s, float *out_temp);
+
 typedef struct {
     char *id;
     char *name;
@@ -2771,6 +2776,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    /* Operator pin: force thinking off for every request before the prompt is
+     * rendered, so gating and prompt formatting stay consistent. */
+    if (server_force_nothink(s)) r->think_mode = DS4_THINK_NONE;
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -2970,6 +2978,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    /* Operator pin: force thinking off for every request before the prompt is
+     * rendered, so gating and prompt formatting stay consistent. */
+    if (server_force_nothink(s)) r->think_mode = DS4_THINK_NONE;
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -3909,6 +3920,9 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    /* Operator pin: force thinking off for every request before the prompt is
+     * rendered, so gating and prompt formatting stay consistent. */
+    if (server_force_nothink(s)) r->think_mode = DS4_THINK_NONE;
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -4099,6 +4113,9 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    /* Operator pin: force thinking off for every request before the prompt is
+     * rendered, so gating and prompt formatting stay consistent. */
+    if (server_force_nothink(s)) r->think_mode = DS4_THINK_NONE;
     buf rendered = {0};
     buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
     if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
@@ -7708,6 +7725,10 @@ struct server {
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    /* Operator sampling pins (see server_config). */
+    bool force_nothink;
+    bool force_temp_set;
+    float force_temp;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -7721,6 +7742,16 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static bool server_force_nothink(const server *s) {
+    return s && s->force_nothink;
+}
+
+static bool server_force_temp(const server *s, float *out_temp) {
+    if (!s || !s->force_temp_set) return false;
+    if (out_temp) *out_temp = s->force_temp;
+    return true;
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -10391,6 +10422,15 @@ decode_again:
             top_p = DS4_DEFAULT_TOP_P;
             min_p = DS4_DEFAULT_MIN_P;
         }
+        /* Operator pin: force the effective temperature, winning over both the
+         * client value and thinking's per-token reset above. This is what lets
+         * `--force-nothink --force-temp 0` open the MTP speculation gate for
+         * every request. Left before the tool-call override so DSML structural
+         * tokens still decode greedily. */
+        {
+            float forced_temp = 0.0f;
+            if (server_force_temp(s, &forced_temp)) temperature = forced_temp;
+        }
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
@@ -11389,6 +11429,11 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    /* Operator pins that override client sampling params and thinking's own
+     * per-token override, so an MTP server speculates for every client. */
+    bool force_nothink;
+    bool force_temp_set;
+    float force_temp;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11547,6 +11592,22 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--force-nothink")) {
+            c.force_nothink = true;
+        } else if (!strcmp(arg, "--thinking")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "off") || !strcmp(v, "pin-off")) {
+                c.force_nothink = true;
+            } else if (!strcmp(v, "on")) {
+                c.force_nothink = false;
+            } else {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --thinking expects off|on|pin-off, got %s", v);
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--force-temp")) {
+            c.force_temp = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.force_temp_set = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -11727,6 +11788,22 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.force_nothink = cfg.force_nothink;
+    s.force_temp_set = cfg.force_temp_set;
+    s.force_temp = cfg.force_temp;
+    if (s.force_nothink || s.force_temp_set) {
+        char temp_note[48];
+        if (s.force_temp_set) {
+            snprintf(temp_note, sizeof(temp_note), "%.3f", s.force_temp);
+        } else {
+            snprintf(temp_note, sizeof(temp_note), "client");
+        }
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: sampling pins active: thinking=%s temperature=%s "
+                   "(overrides client params for every request)",
+                   s.force_nothink ? "forced-off" : "client",
+                   temp_note);
+    }
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
