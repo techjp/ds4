@@ -18991,6 +18991,51 @@ static bool metal_graph_eval_token_raw_swa_top(
     return ok;
 }
 
+/* Diagnostic: read back a GPU tensor and report whether it is all-zero, holds
+ * NaN/Inf, and its finite min/max.  Used to localize where the ROCm MTP draft
+ * forward first produces degenerate values (the constant-token-0 symptom).
+ * Gated on DS4_MTP_DUMP_INTERMEDIATES so it costs nothing in normal runs.  The
+ * caller must have synchronized the device before invoking this. */
+static void mtp_debug_dump_tensor_stats(const char *label,
+                                        const ds4_gpu_tensor *t,
+                                        uint64_t count) {
+    if (!getenv("DS4_MTP_DUMP_INTERMEDIATES")) return;
+    if (!t || count == 0) {
+        fprintf(stderr, "ds4: mtp-dump %-14s <null>\n", label ? label : "?");
+        return;
+    }
+    float *host = xmalloc((size_t)count * sizeof(float));
+    if (ds4_gpu_tensor_read(t, 0, host, count * sizeof(float)) == 0) {
+        fprintf(stderr, "ds4: mtp-dump %-14s <read-failed>\n", label ? label : "?");
+        free(host);
+        return;
+    }
+    uint64_t n_nan = 0, n_inf = 0, n_zero = 0, n_nonzero = 0;
+    float vmin = 0.0f, vmax = 0.0f;
+    bool have_finite = false;
+    for (uint64_t i = 0; i < count; i++) {
+        const float v = host[i];
+        if (isnan(v)) { n_nan++; continue; }
+        if (isinf(v)) { n_inf++; continue; }
+        if (v == 0.0f) n_zero++; else n_nonzero++;
+        if (!have_finite) { vmin = vmax = v; have_finite = true; }
+        else { if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
+    }
+    fprintf(stderr,
+            "ds4: mtp-dump %-14s n=%llu nan=%llu inf=%llu zero=%llu nonzero=%llu "
+            "min=%.4g max=%.4g%s\n",
+            label ? label : "?",
+            (unsigned long long)count,
+            (unsigned long long)n_nan,
+            (unsigned long long)n_inf,
+            (unsigned long long)n_zero,
+            (unsigned long long)n_nonzero,
+            have_finite ? vmin : 0.0f,
+            have_finite ? vmax : 0.0f,
+            (n_nonzero == 0 || n_nan > 0) ? "  <<< DEGENERATE" : "");
+    free(host);
+}
+
 static bool metal_graph_eval_mtp_draft_from_hc(
         ds4_gpu_graph       *g,
         const ds4_model       *base_model,
@@ -19090,6 +19135,21 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     g->cur_hc = saved_cur;
     g->after_ffn_hc = saved_after;
+
+    if (ok && getenv("DS4_MTP_DUMP_INTERMEDIATES")) {
+        /* Device is synchronized by ds4_gpu_end_commands() above.  Walk the
+         * draft forward's chain so the first degenerate stage is obvious:
+         * input assembly -> MTP block output -> output head -> logits. */
+        fprintf(stderr, "ds4: mtp-dump ---- draft pos=%u token=%d ----\n", pos, token);
+        mtp_debug_dump_tensor_stats("prev_hc(in)", prev_hc, hc_dim);
+        mtp_debug_dump_tensor_stats("mtp_eproj_hc", g->mtp_eproj_hc, hc_dim);
+        mtp_debug_dump_tensor_stats("mtp_hproj_hc", g->mtp_hproj_hc, hc_dim);
+        mtp_debug_dump_tensor_stats("mtp_input_hc", g->mtp_input_hc, hc_dim);
+        mtp_debug_dump_tensor_stats("out_hc(block)", out_hc, hc_dim);
+        mtp_debug_dump_tensor_stats("output_embd", g->output_embd, DS4_N_EMBD);
+        mtp_debug_dump_tensor_stats("output_norm", g->output_norm, DS4_N_EMBD);
+        mtp_debug_dump_tensor_stats("logits", g->logits, DS4_N_VOCAB);
+    }
 
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
