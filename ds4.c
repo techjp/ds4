@@ -24865,6 +24865,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* The chunk-copy loader stages its reads through the global model
+         * fd, which at this point still refers to the main model's file.
+         * Associate the MTP file's fd with its map for the duration of the
+         * MTP image copy, otherwise the "MTP image" is silently filled with
+         * bytes read from the main GGUF at the MTP file's offsets. */
+        if (e->mtp_ready)
+            (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
         if (e->mtp_ready &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
@@ -24882,6 +24889,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* Restore the main model's fd/map association for the remaining
+         * main-model load steps below. */
+        if (e->mtp_ready)
+            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!ds4_engine_preload_pro_q4_expert_tables(e,
                                                      load_slice,
                                                      load_layer_start,
